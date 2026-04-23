@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import argparse
 import json
 import logging
@@ -8,6 +10,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from collections import deque, Counter
 from typing import Any, Deque, Dict, List, Optional, Tuple
+
+import ctypes
 
 import cv2
 import numpy as np
@@ -58,12 +62,21 @@ THUMB_X_FALLBACK = 0.05
 
 WINDOW_STATE_FILE = Path(__file__).with_name("window_state.json")
 
+# UI / layout constants
+WINDOW_TITLE = "MediaPipe Gesture App Control"
+HEADER_HEIGHT = 85
+BTN_W, BTN_H = 140, 36
+
 logger = logging.getLogger("gesture_app")
 
 
 # ------------------------- Utility classes ---------------------------------
 class CaptureManager:
-    """Handle video source parsing and opening."""
+    """Handle video source parsing and opening.
+
+    The helpers here try multiple backends for camera indexes and verify a
+    first frame can be read.
+    """
 
     @staticmethod
     def parse_source(source_arg: str):
@@ -89,13 +102,19 @@ class CaptureManager:
             cap = cv2.VideoCapture(src) if backend is None else cv2.VideoCapture(src, backend)
             if not cap.isOpened():
                 attempts.append(f"{label}: cannot open")
-                cap.release()
+                try:
+                    cap.release()
+                except Exception:
+                    pass
                 continue
 
             ok, frame = cap.read()
             if not ok or frame is None:
                 attempts.append(f"{label}: opened but no frames")
-                cap.release()
+                try:
+                    cap.release()
+                except Exception:
+                    pass
                 continue
 
             attempts.append(f"{label}: OK")
@@ -105,7 +124,10 @@ class CaptureManager:
 
 
 class ModelManager:
-    """Download and create MediaPipe landmarker."""
+    """Download and create MediaPipe hand landmarker.
+
+    This isolates network IO and model creation from the main loop.
+    """
 
     @staticmethod
     def ensure_hand_model_downloaded() -> Path:
@@ -115,7 +137,7 @@ class ModelManager:
 
         logger.info("Downloading hand model (first time only)...")
         urllib.request.urlretrieve(HAND_MODEL_URL, model_path)
-        logger.info(f"Model saved at: {model_path}")
+        logger.info("Model saved at: %s", model_path)
         return model_path
 
     @staticmethod
@@ -132,7 +154,8 @@ class ModelManager:
 
 
 class GestureClassifier:
-    """Pure logic for turning hand landmarks into gesture names and smoothing."""
+    """Pure logic for turning hand landmarks into gesture names and smoothing.
+    """
 
     @staticmethod
     def _distance(a, b) -> float:
@@ -341,6 +364,8 @@ class AppController:
 
 
 class AppManager:
+    """Manage AppController instances and expose simple actions."""
+
     def __init__(self, presets: Dict[str, Dict[str, Any]]):
         self.controllers: Dict[str, Tuple[str, AppController]] = {}
         for app_key, data in presets.items():
@@ -418,10 +443,80 @@ class WindowManager:
         return WindowManager.get_window_pos_native(window_name)
 
 
-import ctypes
+def show_frame(win_name: str, frame_img: np.ndarray, overlay: Dict[str, Any]) -> Tuple[int, bool]:
+    """Compose, show and check the window visibility.
+
+    Returns tuple `(key, window_alive)` where `key` is the result of `waitKey`.
+    """
+    display = Visualizer.compose_display(frame_img, win_name, overlay)
+    cv2.imshow(win_name, display)
+    key = cv2.waitKey(1) & 0xFF
+    try:
+        alive = cv2.getWindowProperty(win_name, cv2.WND_PROP_VISIBLE) >= 1
+    except cv2.error:
+        alive = WindowManager.get_window_pos_native(win_name) is not None
+    return key, alive
+
+
+def draw_header(frame_img: np.ndarray, gesture_text: Optional[str], stable: Optional[str], gesture_window: Deque[Optional[str]], last_action_label: str, action_info: str) -> None:
+    """Draw header UI elements on the provided frame in-place."""
+    cv2.rectangle(frame_img, (0, 0), (frame_img.shape[1], HEADER_HEIGHT), (245, 245, 245), -1)
+    cv2.putText(frame_img, f"Gesture: {gesture_text or 'none'}", (10, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (30, 30, 30), 2)
+    try:
+        non_none = [g for g in gesture_window if g is not None]
+        counts = Counter(non_none)
+        votes = counts.get(stable, 0) if stable else 0
+        stab_text = f"Stable: {stable or 'none'} ({votes}/{SMOOTHING_WINDOW})"
+        text_size = cv2.getTextSize(stab_text, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 2)[0]
+        x = frame_img.shape[1] - text_size[0] - 12
+        cv2.putText(frame_img, stab_text, (x, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 140, 0) if stable else (120, 120, 120), 2)
+    except Exception:
+        pass
+    cv2.putText(frame_img, f"Last action: {last_action_label} | {action_info}", (10, 55), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (30, 30, 30), 2)
+    cv2.putText(frame_img, "1:P toggle | 2:C toggle | Open+Fist:N toggle", (10, 78), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (50, 50, 50), 1)
+
+
+def handle_gesture_action(stable_gesture: Optional[str], now_ts: float, state: Dict[str, Any]) -> str:
+    """Encapsulate gesture -> app action logic and update `state` in-place.
+
+    `state` must contain: `last_seen_open_time`, `last_action_time`, `last_action_label`, `last_triggered_gesture`, `app_manager`, `args`.
+    Returns a human-readable `action_info` string describing the attempted action.
+    """
+    if stable_gesture is None:
+        return "waiting"
+
+    if stable_gesture == "open":
+        state["last_seen_open_time"] = now_ts
+        return "waiting"
+
+    if stable_gesture in GESTURE_ACTIONS and stable_gesture != state.get("last_triggered_gesture") and (now_ts - state.get("last_action_time", 0.0)) >= state["args"].cooldown:
+        if stable_gesture == "fist":
+            if state.get("last_seen_open_time", 0.0) == 0.0 or (now_ts - state.get("last_seen_open_time", 0.0)) > SEQUENCE_WINDOW:
+                return "waiting for open->fist sequence"
+            else:
+                app_key, operation = GESTURE_ACTIONS[stable_gesture]
+                action_info_res, last_label, ok = state["app_manager"].perform_app_action(app_key, operation)
+                if ok and last_label:
+                    state["last_action_label"] = last_label
+                    state["last_action_time"] = now_ts
+                    state["last_triggered_gesture"] = stable_gesture
+                    state["last_seen_open_time"] = 0.0
+                return action_info_res
+        else:
+            app_key, operation = GESTURE_ACTIONS[stable_gesture]
+            action_info_res, last_label, ok = state["app_manager"].perform_app_action(app_key, operation)
+            if ok and last_label:
+                state["last_action_label"] = last_label
+            if ok:
+                state["last_action_time"] = now_ts
+                state["last_triggered_gesture"] = stable_gesture
+            return action_info_res
+
+    return "waiting"
 
 
 def main() -> None:
+    """Entry point: wire components and run the main loop."""
     logging.basicConfig(level=logging.INFO)
     parser = argparse.ArgumentParser(description="Control simple de apps con gestos usando MediaPipe Hands")
     parser.add_argument("--source", default="0", help="Camera index (0,1,2...) or video path. Default: 0")
@@ -448,7 +543,7 @@ def main() -> None:
 
     gesture_window: Deque[Optional[str]] = deque(maxlen=SMOOTHING_WINDOW)
     no_gesture_start = 0.0
-    window_name = "MediaPipe Gesture App Control"
+    window_name = WINDOW_TITLE
     last_timestamp_ms = 0
 
     cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
@@ -464,7 +559,18 @@ def main() -> None:
     logger.info("Gesture control ready")
     logger.info("Gesture mapping: 1->Paint toggle, 2->Calculator toggle, Open+Fist->Notepad toggle")
 
+    
+
     try:
+        state = {
+            "last_seen_open_time": last_seen_open_time,
+            "last_action_time": last_action_time,
+            "last_action_label": last_action_label,
+            "last_triggered_gesture": last_triggered_gesture,
+            "app_manager": app_manager,
+            "args": args,
+        }
+
         while True:
             ok, frame = cap.read()
             if not ok:
@@ -491,81 +597,36 @@ def main() -> None:
             gesture_window.append(gesture)
             stable_gesture = GestureClassifier.get_stable_gesture(gesture_window)
 
-            try:
-                if overlay_state.get("enabled", True):
+            if overlay_state.get("enabled", True):
+                try:
                     Visualizer.draw_detection_overlay(frame, result.hand_landmarks[0] if result.hand_landmarks else None, handedness_label)
-            except Exception:
-                pass
+                except Exception:
+                    logger.debug("draw_detection_overlay failed", exc_info=True)
 
             now = time.monotonic()
-            action_info = "waiting"
 
+            # Clear last-trigger on long no-gesture
             if stable_gesture is None:
                 if no_gesture_start == 0.0:
                     no_gesture_start = now
                 elif (now - no_gesture_start) > NO_GESTURE_CLEAR_TIME:
-                    last_triggered_gesture = None
+                    state["last_triggered_gesture"] = None
             else:
                 no_gesture_start = 0.0
-                if stable_gesture == "open":
-                    last_seen_open_time = now
-                elif stable_gesture in GESTURE_ACTIONS and stable_gesture != last_triggered_gesture and (now - last_action_time) >= args.cooldown:
-                    if stable_gesture == "fist":
-                        if last_seen_open_time == 0.0 or (now - last_seen_open_time) > SEQUENCE_WINDOW:
-                            action_info = "waiting for open->fist sequence"
-                        else:
-                            app_key, operation = GESTURE_ACTIONS[stable_gesture]
-                            action_info_res, last_label, ok = app_manager.perform_app_action(app_key, operation)
-                            action_info = action_info_res
-                            if ok and last_label:
-                                last_action_label = last_label
-                                last_action_time = now
-                                last_triggered_gesture = stable_gesture
-                                last_seen_open_time = 0.0
-                    else:
-                        app_key, operation = GESTURE_ACTIONS[stable_gesture]
-                        action_info_res, last_label, ok = app_manager.perform_app_action(app_key, operation)
-                        action_info = action_info_res
-                        if ok and last_label:
-                            last_action_label = last_label
-                        if ok:
-                            last_action_time = now
-                            last_triggered_gesture = stable_gesture
 
-            cv2.rectangle(frame, (0, 0), (frame.shape[1], 85), (245, 245, 245), -1)
-            cv2.putText(frame, f"Gesture: {gesture or 'none'}", (10, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (30, 30, 30), 2)
+            action_info = handle_gesture_action(stable_gesture, now, state)
 
-            try:
-                non_none = [g for g in gesture_window if g is not None]
-                counts = Counter(non_none)
-                votes = counts.get(stable_gesture, 0) if stable_gesture else 0
-                stab_text = f"Stable: {stable_gesture or 'none'} ({votes}/{SMOOTHING_WINDOW})"
-                text_size = cv2.getTextSize(stab_text, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 2)[0]
-                x = frame.shape[1] - text_size[0] - 12
-                cv2.putText(frame, stab_text, (x, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 140, 0) if stable_gesture else (120, 120, 120), 2)
-            except Exception:
-                pass
+            # Update local variables from state (for persistence and display)
+            last_action_time = state["last_action_time"]
+            last_action_label = state["last_action_label"]
+            last_triggered_gesture = state["last_triggered_gesture"]
+            last_seen_open_time = state["last_seen_open_time"]
 
-            cv2.putText(frame, f"Last action: {last_action_label} | {action_info}", (10, 55), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (30, 30, 30), 2)
-            cv2.putText(frame, "1:P toggle | 2:C toggle | Open+Fist:N toggle", (10, 78), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (50, 50, 50), 1)
+            draw_header(frame, gesture, stable_gesture, gesture_window, last_action_label, action_info)
 
-            try:
-                if cv2.getWindowProperty(window_name, cv2.WND_PROP_VISIBLE) < 1:
-                    break
-            except Exception:
-                if WindowManager.get_window_pos_native(window_name) is None:
-                    break
-
-            display = Visualizer.compose_display(frame, window_name, overlay_state)
-            cv2.imshow(window_name, display)
-            key = cv2.waitKey(1) & 0xFF
-
-            try:
-                if cv2.getWindowProperty(window_name, cv2.WND_PROP_VISIBLE) < 1:
-                    break
-            except Exception:
-                if WindowManager.get_window_pos_native(window_name) is None:
-                    break
+            key, alive = show_frame(window_name, frame, overlay_state)
+            if not alive:
+                break
 
             if key == 27 or key in (ord("q"), ord("Q")):
                 break
