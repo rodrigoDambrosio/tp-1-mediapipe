@@ -9,6 +9,9 @@ import cv2
 import mediapipe as mp
 from mediapipe.tasks import python as mp_python
 from mediapipe.tasks.python import vision
+import json
+import ctypes
+from ctypes import wintypes
 
 
 APP_PRESETS = {
@@ -201,6 +204,57 @@ def build_app_controllers() -> dict[str, tuple[str, AppController]]:
     return controllers
 
 
+# Window position persistence
+WINDOW_STATE_FILE = Path(__file__).with_name("window_state.json")
+
+
+def load_window_pos() -> tuple[int, int] | None:
+    if not WINDOW_STATE_FILE.exists():
+        return None
+    try:
+        data = json.loads(WINDOW_STATE_FILE.read_text())
+        return int(data.get("x")), int(data.get("y"))
+    except Exception:
+        return None
+
+
+def save_window_pos(x: int, y: int) -> None:
+    try:
+        WINDOW_STATE_FILE.write_text(json.dumps({"x": int(x), "y": int(y)}))
+    except Exception:
+        pass
+
+
+def get_window_pos_native(window_name: str) -> tuple[int, int] | None:
+    try:
+        FindWindow = ctypes.windll.user32.FindWindowW
+        GetWindowRect = ctypes.windll.user32.GetWindowRect
+        class RECT(ctypes.Structure):
+            _fields_ = [("left", ctypes.c_long), ("top", ctypes.c_long), ("right", ctypes.c_long), ("bottom", ctypes.c_long)]
+
+        hwnd = FindWindow(None, window_name)
+        if not hwnd:
+            return None
+        rect = RECT()
+        res = GetWindowRect(hwnd, ctypes.byref(rect))
+        if res == 0:
+            return None
+        return rect.left, rect.top
+    except Exception:
+        return None
+
+
+def get_window_pos(window_name: str) -> tuple[int, int] | None:
+    # Prefer OpenCV's API if available
+    try:
+        rect = cv2.getWindowImageRect(window_name)
+        if rect and len(rect) >= 2:
+            return int(rect[0]), int(rect[1])
+    except Exception:
+        pass
+    return get_window_pos_native(window_name)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Control simple de apps con gestos usando MediaPipe Hands"
@@ -233,6 +287,17 @@ def main() -> None:
     last_action_time = 0.0
     last_action_label = "none"
     last_triggered_gesture = None
+    window_name = "MediaPipe Gesture App Control"
+    # Keep a strictly increasing timestamp for MediaPipe's video API
+    last_timestamp_ms = 0
+    # Create window and restore last position if available
+    cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+    pos = load_window_pos()
+    if pos:
+        try:
+            cv2.moveWindow(window_name, pos[0], pos[1])
+        except Exception:
+            pass
 
     print("Gesture control ready")
     print("Gesture mapping:")
@@ -250,7 +315,11 @@ def main() -> None:
             frame = cv2.flip(frame, 1)
             rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
-            timestamp_ms = int(time.monotonic() * 1000)
+            # Use higher-resolution monotonic clock to reduce timestamp collisions
+            timestamp_ms = time.monotonic_ns() // 1_000_000
+            if timestamp_ms <= last_timestamp_ms:
+                timestamp_ms = last_timestamp_ms + 1
+            last_timestamp_ms = timestamp_ms
 
             result = landmarker.detect_for_video(mp_image, timestamp_ms)
 
@@ -327,11 +396,35 @@ def main() -> None:
                 1,
             )
 
-            cv2.imshow("MediaPipe Gesture App Control", frame)
+            # Check whether the window still exists before showing a frame.
+            try:
+                if cv2.getWindowProperty(window_name, cv2.WND_PROP_VISIBLE) < 1:
+                    break
+            except Exception:
+                if get_window_pos_native(window_name) is None:
+                    break
+
+            cv2.imshow(window_name, frame)
             key = cv2.waitKey(1) & 0xFF
+
+            # Re-check after waitKey in case the user closed the window while it was shown.
+            try:
+                if cv2.getWindowProperty(window_name, cv2.WND_PROP_VISIBLE) < 1:
+                    break
+            except Exception:
+                if get_window_pos_native(window_name) is None:
+                    break
+
             if key == 27 or key in (ord("q"), ord("Q")):
                 break
     finally:
+        # Save current window position
+        try:
+            pos = get_window_pos(window_name)
+            if pos:
+                save_window_pos(pos[0], pos[1])
+        except Exception:
+            pass
         cap.release()
         landmarker.close()
         cv2.destroyAllWindows()
