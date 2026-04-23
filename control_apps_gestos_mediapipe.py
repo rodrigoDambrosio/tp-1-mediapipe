@@ -51,6 +51,7 @@ AVG_TIP_WRIST_THRESHOLD = 0.22
 SMOOTHING_WINDOW = 5
 SMOOTHING_THRESHOLD = 3
 SEQUENCE_WINDOW = 2.0
+NO_GESTURE_CLEAR_TIME = 1.0  # seconds of sustained None before clearing last_triggered_gesture
 
 
 def parse_source(source_arg: str):
@@ -150,7 +151,7 @@ def classify_gesture(hand_landmarks, handedness_label: str | None = None) -> str
     tip_indices = [4, 8, 12, 16, 20]
     avg_tip_wrist = sum(_distance(hand_landmarks[idx], wrist) for idx in tip_indices) / len(tip_indices)
 
-    # Detect open hand when most fingers (including thumb) are extended
+    # Detect open hand only when all five fingers (including thumb) are extended
     if extended > 4 and avg_tip_wrist > AVG_TIP_WRIST_THRESHOLD:
         return "open"
 
@@ -452,6 +453,8 @@ def main() -> None:
     last_seen_open_time = 0.0
     # Gesture smoothing window
     gesture_window = deque(maxlen=SMOOTHING_WINDOW)
+    # Track when we first saw a sustained 'no gesture' (stable_gesture is None)
+    no_gesture_start = 0.0
     window_name = "MediaPipe Gesture App Control"
     # Keep a strictly increasing timestamp for MediaPipe's video API
     last_timestamp_ms = 0
@@ -528,33 +531,43 @@ def main() -> None:
             action_info = "waiting"
             # Use the smoothed/stable gesture for control decisions
             if stable_gesture is None:
-                last_triggered_gesture = None
-            elif stable_gesture == "open":
-                # record the time we saw an open hand; waiting for fist next
-                last_seen_open_time = now
-            elif stable_gesture in GESTURE_ACTIONS and stable_gesture != last_triggered_gesture and (now - last_action_time) >= args.cooldown:
-                # For fist, require open -> fist sequence within SEQUENCE_WINDOW
-                if stable_gesture == "fist":
-                    if last_seen_open_time == 0.0 or (now - last_seen_open_time) > SEQUENCE_WINDOW:
-                        action_info = "waiting for open->fist sequence"
+                # Start or continue the no-gesture timer; only clear the
+                # last_triggered_gesture after None persists longer than
+                # NO_GESTURE_CLEAR_TIME. This prevents transient detection
+                # dropouts from allowing an identical gesture to retrigger.
+                if no_gesture_start == 0.0:
+                    no_gesture_start = now
+                elif (now - no_gesture_start) > NO_GESTURE_CLEAR_TIME:
+                    last_triggered_gesture = None
+            else:
+                # Reset no-gesture timer when we have a valid stable gesture
+                no_gesture_start = 0.0
+                if stable_gesture == "open":
+                    # record the time we saw an open hand; waiting for fist next
+                    last_seen_open_time = now
+                elif stable_gesture in GESTURE_ACTIONS and stable_gesture != last_triggered_gesture and (now - last_action_time) >= args.cooldown:
+                    # For fist, require open -> fist sequence within SEQUENCE_WINDOW
+                    if stable_gesture == "fist":
+                        if last_seen_open_time == 0.0 or (now - last_seen_open_time) > SEQUENCE_WINDOW:
+                            action_info = "waiting for open->fist sequence"
+                        else:
+                            app_key, operation = GESTURE_ACTIONS[stable_gesture]
+                            action_info_res, last_label, ok = perform_app_action(app_key, operation, controllers)
+                            action_info = action_info_res
+                            if ok and last_label:
+                                last_action_label = last_label
+                                last_action_time = now
+                                last_triggered_gesture = stable_gesture
+                                last_seen_open_time = 0.0
                     else:
                         app_key, operation = GESTURE_ACTIONS[stable_gesture]
                         action_info_res, last_label, ok = perform_app_action(app_key, operation, controllers)
                         action_info = action_info_res
                         if ok and last_label:
                             last_action_label = last_label
+                        if ok:
                             last_action_time = now
                             last_triggered_gesture = stable_gesture
-                            last_seen_open_time = 0.0
-                else:
-                    app_key, operation = GESTURE_ACTIONS[stable_gesture]
-                    action_info_res, last_label, ok = perform_app_action(app_key, operation, controllers)
-                    action_info = action_info_res
-                    if ok and last_label:
-                        last_action_label = last_label
-                    if ok:
-                        last_action_time = now
-                        last_triggered_gesture = stable_gesture
 
             cv2.rectangle(frame, (0, 0), (frame.shape[1], 85), (245, 245, 245), -1)
             cv2.putText(
