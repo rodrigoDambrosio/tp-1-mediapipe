@@ -52,6 +52,9 @@ SMOOTHING_WINDOW = 5
 SMOOTHING_THRESHOLD = 3
 SEQUENCE_WINDOW = 2.0
 NO_GESTURE_CLEAR_TIME = 1.0  # seconds of sustained None before clearing last_triggered_gesture
+# Thumb detection thresholds
+THUMB_X_DELTA_THRESHOLD = 0.015
+THUMB_X_FALLBACK = 0.05
 
 
 def parse_source(source_arg: str):
@@ -139,11 +142,11 @@ def classify_gesture(hand_landmarks, handedness_label: str | None = None) -> str
 
     thumb_extended = False
     if handedness_label == "Right":
-        thumb_extended = hand_landmarks[4].x < hand_landmarks[3].x - 0.015
+        thumb_extended = hand_landmarks[4].x < hand_landmarks[3].x - THUMB_X_DELTA_THRESHOLD
     elif handedness_label == "Left":
-        thumb_extended = hand_landmarks[4].x > hand_landmarks[3].x + 0.015
+        thumb_extended = hand_landmarks[4].x > hand_landmarks[3].x + THUMB_X_DELTA_THRESHOLD
     else:
-        thumb_extended = abs(hand_landmarks[4].x - hand_landmarks[3].x) > 0.05
+        thumb_extended = abs(hand_landmarks[4].x - hand_landmarks[3].x) > THUMB_X_FALLBACK
 
     if thumb_extended:
         extended += 1
@@ -151,7 +154,8 @@ def classify_gesture(hand_landmarks, handedness_label: str | None = None) -> str
     tip_indices = [4, 8, 12, 16, 20]
     avg_tip_wrist = sum(_distance(hand_landmarks[idx], wrist) for idx in tip_indices) / len(tip_indices)
 
-    # Detect open hand only when all five fingers (including thumb) are extended
+    # Detect open hand only when all five fingers (including thumb)
+    # are extended (i.e. `extended > 4`). This is a strict requirement.
     if extended > 4 and avg_tip_wrist > AVG_TIP_WRIST_THRESHOLD:
         return "open"
 
@@ -177,7 +181,6 @@ def draw_detection_overlay(
     gesture_window,
     stable_gesture,
     smoothing_window,
-    smoothing_threshold,
     last_seen_open_time,
     sequence_window,
 ):
@@ -239,11 +242,11 @@ def draw_detection_overlay(
         thumb_tip = hand_landmarks[4]
         thumb_ip = hand_landmarks[3]
         if handedness_label == "Right":
-            thumb_ext = thumb_tip.x < thumb_ip.x - 0.015
+            thumb_ext = thumb_tip.x < thumb_ip.x - THUMB_X_DELTA_THRESHOLD
         elif handedness_label == "Left":
-            thumb_ext = thumb_tip.x > thumb_ip.x + 0.015
+            thumb_ext = thumb_tip.x > thumb_ip.x + THUMB_X_DELTA_THRESHOLD
         else:
-            thumb_ext = abs(thumb_tip.x - thumb_ip.x) > 0.05
+            thumb_ext = abs(thumb_tip.x - thumb_ip.x) > THUMB_X_FALLBACK
         tt = (int(thumb_tip.x * w), int(thumb_tip.y * h))
         ti = (int(thumb_ip.x * w), int(thumb_ip.y * h))
         col = (0, 200, 0) if thumb_ext else (0, 0, 200)
@@ -291,8 +294,16 @@ def draw_detection_overlay(
         left = sequence_window - (now - last_seen_open_time)
         cv2.putText(frame, f"wait {left:.1f}s", (seq_x + 10, seq_y - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 160, 255), 2)
 
-    # Thresholds info
-    cv2.putText(frame, "y_delta=0.015 | avg_r=0.22", (10, frame.shape[0] - 45), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (100, 100, 100), 1)
+    # Thresholds info (reflect active constants)
+    cv2.putText(
+        frame,
+        f"y_delta={Y_DELTA_THRESHOLD:.3f} | avg_r={AVG_TIP_WRIST_THRESHOLD:.2f} | thumb_x={THUMB_X_DELTA_THRESHOLD:.3f}",
+        (10, frame.shape[0] - 45),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.5,
+        (100, 100, 100),
+        1,
+    )
 
 
 def on_mouse(event, x, y, flags, param):
@@ -518,28 +529,30 @@ def main() -> None:
 
             # Determine stable gesture by majority vote over the window
             stable_gesture = None
-            if len(gesture_window) > 0:
-                counts = Counter(gesture_window)
+            # Ignore None entries when selecting the stable gesture so that
+            # transient 'no detection' frames don't mask a valid gesture.
+            non_none = [g for g in gesture_window if g is not None]
+            if len(non_none) > 0:
+                counts = Counter(non_none)
                 most = counts.most_common(1)
                 if most:
                     candidate, votes = most[0]
-                    if candidate is not None and votes >= SMOOTHING_THRESHOLD:
+                    if votes >= SMOOTHING_THRESHOLD:
                         stable_gesture = candidate
 
             # Draw debug overlay showing landmarks, per-finger ext, smoothing timeline
             try:
                 if overlay_state.get("enabled", True):
-                    draw_detection_overlay(
-                        frame,
-                        result.hand_landmarks[0] if result.hand_landmarks else None,
-                        handedness_label,
-                        gesture_window,
-                        stable_gesture,
-                        SMOOTHING_WINDOW,
-                        SMOOTHING_THRESHOLD,
-                        last_seen_open_time,
-                        SEQUENCE_WINDOW,
-                    )
+                            draw_detection_overlay(
+                                frame,
+                                result.hand_landmarks[0] if result.hand_landmarks else None,
+                                handedness_label,
+                                gesture_window,
+                                stable_gesture,
+                                SMOOTHING_WINDOW,
+                                last_seen_open_time,
+                                SEQUENCE_WINDOW,
+                            )
             except Exception:
                 pass
 
@@ -614,9 +627,31 @@ def main() -> None:
                 1,
             )
 
-            # Draw overlay toggle button (top-right)
+            # Compose a display image that fits the current window while
+            # preserving aspect ratio. Draw the overlay toggle button on the
+            # final display so mouse coordinates match window coordinates.
+            try:
+                win_x, win_y, win_w, win_h = cv2.getWindowImageRect(window_name)
+            except Exception:
+                win_w, win_h = frame.shape[1], frame.shape[0]
+
+            # Compute scale and centered offsets
+            scale = min(win_w / frame.shape[1], win_h / frame.shape[0])
+            new_w = max(1, int(frame.shape[1] * scale))
+            new_h = max(1, int(frame.shape[0] * scale))
+            interp = cv2.INTER_AREA if scale < 1.0 else cv2.INTER_LINEAR
+            resized = cv2.resize(frame, (new_w, new_h), interpolation=interp)
+
+            # Create display background and place resized frame centered
+            import numpy as np
+            display = np.full((win_h, win_w, 3), 245, dtype=np.uint8)
+            xoff = (win_w - new_w) // 2
+            yoff = (win_h - new_h) // 2
+            display[yoff : yoff + new_h, xoff : xoff + new_w] = resized
+
+            # Draw overlay toggle button (top-right) on display
             btn_w, btn_h = 140, 36
-            bx1 = frame.shape[1] - btn_w - 10
+            bx1 = win_w - btn_w - 10
             by1 = 10
             bx2 = bx1 + btn_w
             by2 = by1 + btn_h
@@ -627,11 +662,10 @@ def main() -> None:
             else:
                 btn_color = (80, 80, 80)
                 txt = "DEBUG: OFF"
-            cv2.rectangle(frame, (bx1, by1), (bx2, by2), btn_color, -1)
-            cv2.rectangle(frame, (bx1, by1), (bx2, by2), (0, 0, 0), 1)
-            # slightly smaller text to fit the larger button
+            cv2.rectangle(display, (bx1, by1), (bx2, by2), btn_color, -1)
+            cv2.rectangle(display, (bx1, by1), (bx2, by2), (0, 0, 0), 1)
             text_y = by1 + int(btn_h * 0.65)
-            cv2.putText(frame, txt, (bx1 + 8, text_y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1)
+            cv2.putText(display, txt, (bx1 + 8, text_y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1)
 
             # Check whether the window still exists before showing a frame.
             try:
@@ -641,7 +675,8 @@ def main() -> None:
                 if get_window_pos_native(window_name) is None:
                     break
 
-            cv2.imshow(window_name, frame)
+            # Show the composed display (resized, centered)
+            cv2.imshow(window_name, display)
             key = cv2.waitKey(1) & 0xFF
 
             # Re-check after waitKey in case the user closed the window while it was shown.
