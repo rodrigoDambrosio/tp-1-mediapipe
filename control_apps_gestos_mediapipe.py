@@ -7,12 +7,13 @@ from pathlib import Path
 from collections import deque, Counter
 
 import cv2
+import numpy as np
 import mediapipe as mp
 from mediapipe.tasks import python as mp_python
 from mediapipe.tasks.python import vision
 import json
 import ctypes
-from ctypes import wintypes
+from typing import Any
 
 
 APP_PRESETS = {
@@ -51,6 +52,9 @@ AVG_TIP_WRIST_THRESHOLD = 0.22
 SMOOTHING_WINDOW = 5
 SMOOTHING_THRESHOLD = 3
 SEQUENCE_WINDOW = 2.0
+NO_GESTURE_CLEAR_TIME = 1.0
+THUMB_X_DELTA_THRESHOLD = 0.015
+THUMB_X_FALLBACK = 0.05
 
 
 def parse_source(source_arg: str):
@@ -102,7 +106,7 @@ def ensure_hand_model_downloaded() -> Path:
     return model_path
 
 
-def create_landmarker(model_path: Path, max_hands: int = 1) -> vision.HandLandmarker:
+def create_landmarker(model_path: Path, max_hands: int = 1) -> Any:
     options = vision.HandLandmarkerOptions(
         base_options=mp_python.BaseOptions(model_asset_path=str(model_path)),
         running_mode=vision.RunningMode.VIDEO,
@@ -125,10 +129,10 @@ def classify_gesture(hand_landmarks, handedness_label: str | None = None) -> str
     wrist = hand_landmarks[0]
 
     finger_pairs = [
-        (8, 6),   # index
-        (12, 10), # middle
-        (16, 14), # ring
-        (20, 18), # pinky
+        (8, 6),
+        (12, 10),
+        (16, 14),
+        (20, 18),
     ]
 
     extended = 0
@@ -138,11 +142,11 @@ def classify_gesture(hand_landmarks, handedness_label: str | None = None) -> str
 
     thumb_extended = False
     if handedness_label == "Right":
-        thumb_extended = hand_landmarks[4].x < hand_landmarks[3].x - 0.015
+        thumb_extended = hand_landmarks[4].x < hand_landmarks[3].x - THUMB_X_DELTA_THRESHOLD
     elif handedness_label == "Left":
-        thumb_extended = hand_landmarks[4].x > hand_landmarks[3].x + 0.015
+        thumb_extended = hand_landmarks[4].x > hand_landmarks[3].x + THUMB_X_DELTA_THRESHOLD
     else:
-        thumb_extended = abs(hand_landmarks[4].x - hand_landmarks[3].x) > 0.05
+        thumb_extended = abs(hand_landmarks[4].x - hand_landmarks[3].x) > THUMB_X_FALLBACK
 
     if thumb_extended:
         extended += 1
@@ -150,7 +154,8 @@ def classify_gesture(hand_landmarks, handedness_label: str | None = None) -> str
     tip_indices = [4, 8, 12, 16, 20]
     avg_tip_wrist = sum(_distance(hand_landmarks[idx], wrist) for idx in tip_indices) / len(tip_indices)
 
-    # Detect open hand when most fingers (including thumb) are extended
+    # Detect open hand only when all five fingers (including thumb)
+    # are extended (i.e. `extended > 4`). This is a strict requirement.
     if extended > 4 and avg_tip_wrist > AVG_TIP_WRIST_THRESHOLD:
         return "open"
 
@@ -169,35 +174,14 @@ def classify_gesture(hand_landmarks, handedness_label: str | None = None) -> str
     return None
 
 
-def draw_detection_overlay(
-    frame,
-    hand_landmarks,
-    handedness_label,
-    gesture_window,
-    stable_gesture,
-    smoothing_window,
-    smoothing_threshold,
-    last_seen_open_time,
-    sequence_window,
-):
+def draw_detection_overlay(frame, hand_landmarks, handedness_label):
     h, w = frame.shape[:2]
-    now = time.monotonic()
 
-    # color palette
-    COLORS = {
-        None: (200, 200, 200),
-        "open": (0, 200, 0),
-        "fist": (0, 0, 200),
-        "one": (255, 0, 0),
-        "two": (0, 180, 180),
-        "three": (0, 180, 255),
-    }
-
-    # Draw landmarks and bones if available
+    
     if hand_landmarks:
         pts = [(int(lm.x * w), int(lm.y * h)) for lm in hand_landmarks]
 
-        # simple skeleton connections (approximate MediaPipe topology)
+        
         connections = [
             (0, 1), (1, 2), (2, 3), (3, 4),
             (0, 5), (5, 6), (6, 7), (7, 8),
@@ -214,7 +198,7 @@ def draw_detection_overlay(
         for i, p in enumerate(pts):
             cv2.circle(frame, p, 3, (40, 40, 40), -1)
 
-        # Per-finger extension visual (tip vs pip)
+        
         finger_pairs = [(8, 6), (12, 10), (16, 14), (20, 18)]
         for tip_idx, pip_idx in finger_pairs:
             tip = hand_landmarks[tip_idx]
@@ -234,26 +218,26 @@ def draw_detection_overlay(
                 1,
             )
 
-        # Thumb indicator
+        
         thumb_tip = hand_landmarks[4]
         thumb_ip = hand_landmarks[3]
         if handedness_label == "Right":
-            thumb_ext = thumb_tip.x < thumb_ip.x - 0.015
+            thumb_ext = thumb_tip.x < thumb_ip.x - THUMB_X_DELTA_THRESHOLD
         elif handedness_label == "Left":
-            thumb_ext = thumb_tip.x > thumb_ip.x + 0.015
+            thumb_ext = thumb_tip.x > thumb_ip.x + THUMB_X_DELTA_THRESHOLD
         else:
-            thumb_ext = abs(thumb_tip.x - thumb_ip.x) > 0.05
+            thumb_ext = abs(thumb_tip.x - thumb_ip.x) > THUMB_X_FALLBACK
         tt = (int(thumb_tip.x * w), int(thumb_tip.y * h))
         ti = (int(thumb_ip.x * w), int(thumb_ip.y * h))
         col = (0, 200, 0) if thumb_ext else (0, 0, 200)
         cv2.line(frame, ti, tt, col, 3)
         cv2.putText(frame, "T-EXT" if thumb_ext else "T-FLX", (ti[0] - 10, ti[1] - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.4, col, 1)
 
-        # Wrist radius circle based on avg tip distance
+        
         wrist = hand_landmarks[0]
         tip_indices = [4, 8, 12, 16, 20]
         avg_tip_wrist = sum(_distance(hand_landmarks[idx], wrist) for idx in tip_indices) / len(tip_indices)
-        # scale normalized distance to pixels (rough)
+        
         scale = (w + h) / 2.0
         radius_px = max(6, int(avg_tip_wrist * scale * 0.5))
         wrist_pt = (int(wrist.x * w), int(wrist.y * h))
@@ -261,37 +245,19 @@ def draw_detection_overlay(
         cv2.circle(frame, wrist_pt, radius_px, col, 2)
         cv2.putText(frame, f"r={avg_tip_wrist:.2f}", (wrist_pt[0] + 8, wrist_pt[1] + 8), cv2.FONT_HERSHEY_SIMPLEX, 0.4, col, 1)
 
-    # Draw smoothing timeline (top-right)
-    box_w = 18
-    box_h = 18
-    spacing = 6
-    start_x = frame.shape[1] - (box_w + spacing) * smoothing_window - 10
-    y = 10
-    counts = Counter(gesture_window)
-    for i in range(smoothing_window):
-        idx = max(0, len(gesture_window) - smoothing_window) + i
-        g = gesture_window[idx] if idx < len(gesture_window) else None
-        col = COLORS.get(g, (200, 200, 200))
-        x = start_x + i * (box_w + spacing)
-        cv2.rectangle(frame, (x, y), (x + box_w, y + box_h), col, -1)
-        if g:
-            cv2.putText(frame, (g[0] if g else "-"), (x + 4, y + 14), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 0), 1)
+    
 
-    # Stable gesture and votes
-    votes = counts.get(stable_gesture, 0) if stable_gesture else 0
-    stable_col = COLORS.get(stable_gesture, (200, 200, 200))
-    cv2.putText(frame, f"Stable: {stable_gesture or 'none'} ({votes}/{smoothing_window})", (10, frame.shape[0] - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, stable_col, 2)
 
-    # Sequence indicator
-    seq_x = frame.shape[1] - 220
-    seq_y = frame.shape[0] - 40
-    cv2.putText(frame, "[OPEN] -> [FIST]", (seq_x, seq_y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (80, 80, 80), 2)
-    if last_seen_open_time and (now - last_seen_open_time) <= sequence_window:
-        left = sequence_window - (now - last_seen_open_time)
-        cv2.putText(frame, f"wait {left:.1f}s", (seq_x + 10, seq_y - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 160, 255), 2)
+def on_mouse(event, x, y, flags, param):
+    """Mouse callback to toggle overlay when the button is clicked.
 
-    # Thresholds info
-    cv2.putText(frame, "y_delta=0.015 | avg_r=0.22", (10, frame.shape[0] - 45), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (100, 100, 100), 1)
+    `param` is expected to be a dict with keys `enabled` and `rect`.
+    """
+    state = param
+    if event == cv2.EVENT_LBUTTONDOWN:
+        x1, y1, x2, y2 = state.get("rect", (0, 0, 0, 0))
+        if x1 <= x <= x2 and y1 <= y <= y2:
+            state["enabled"] = not state.get("enabled", True)
 
 
 @dataclass
@@ -361,12 +327,67 @@ def perform_app_action(app_key: str, operation: str, controllers: dict[str, tupl
             ok = controller.open_app()
             return (f"opened {app_label}" if ok else f"open {app_label} failed", f"open {app_label}" if ok else None, ok)
 
-    # fallback: try to close
+    
     ok = controller.close_app()
     return (f"closed {app_label}" if ok else f"close {app_label} failed", f"close {app_label}" if ok else None, ok)
 
 
-# Window position persistence
+def get_stable_gesture(gesture_window: deque) -> str | None:
+    """Return the stable gesture from the recent window or None.
+
+    Ignores None entries (no detection) so short dropouts don't mask
+    an otherwise-consistent gesture.
+    """
+    non_none = [g for g in gesture_window if g is not None]
+    if not non_none:
+        return None
+    counts = Counter(non_none)
+    candidate, votes = counts.most_common(1)[0]
+    return candidate if votes >= SMOOTHING_THRESHOLD else None
+
+
+def compose_display(frame, window_name: str, overlay_state: dict) -> np.ndarray:
+    """Scale `frame` to the current window while preserving aspect ratio,
+    center it on a neutral background and draw the overlay toggle button.
+    Returns the composed image to pass to `cv2.imshow`.
+    """
+    try:
+        _, _, win_w, win_h = cv2.getWindowImageRect(window_name)
+    except Exception:
+        win_w, win_h = frame.shape[1], frame.shape[0]
+
+    scale = min(win_w / frame.shape[1], win_h / frame.shape[0])
+    new_w = max(1, int(frame.shape[1] * scale))
+    new_h = max(1, int(frame.shape[0] * scale))
+    interp = cv2.INTER_AREA if scale < 1.0 else cv2.INTER_LINEAR
+    resized = cv2.resize(frame, (new_w, new_h), interpolation=interp)
+
+    display = np.full((win_h, win_w, 3), 245, dtype=np.uint8)
+    xoff = (win_w - new_w) // 2
+    yoff = (win_h - new_h) // 2
+    display[yoff : yoff + new_h, xoff : xoff + new_w] = resized
+
+    
+    btn_w, btn_h = 140, 36
+    bx2 = win_w - 10
+    by2 = win_h - 10
+    bx1 = bx2 - btn_w
+    by1 = by2 - btn_h
+    overlay_state["rect"] = (bx1, by1, bx2, by2)
+    if overlay_state.get("enabled", True):
+        btn_color = (0, 200, 0)
+        txt = "DEBUG: ON"
+    else:
+        btn_color = (80, 80, 80)
+        txt = "DEBUG: OFF"
+    cv2.rectangle(display, (bx1, by1), (bx2, by2), btn_color, -1)
+    cv2.rectangle(display, (bx1, by1), (bx2, by2), (0, 0, 0), 1)
+    text_y = by1 + int(btn_h * 0.65)
+    cv2.putText(display, txt, (bx1 + 8, text_y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1)
+    return display
+
+
+
 WINDOW_STATE_FILE = Path(__file__).with_name("window_state.json")
 
 
@@ -407,7 +428,7 @@ def get_window_pos_native(window_name: str) -> tuple[int, int] | None:
 
 
 def get_window_pos(window_name: str) -> tuple[int, int] | None:
-    # Prefer OpenCV's API if available
+    
     try:
         rect = cv2.getWindowImageRect(window_name)
         if rect and len(rect) >= 2:
@@ -452,11 +473,16 @@ def main() -> None:
     last_seen_open_time = 0.0
     # Gesture smoothing window
     gesture_window = deque(maxlen=SMOOTHING_WINDOW)
+    # Track when we first saw a sustained 'no gesture' (stable_gesture is None)
+    no_gesture_start = 0.0
     window_name = "MediaPipe Gesture App Control"
     # Keep a strictly increasing timestamp for MediaPipe's video API
     last_timestamp_ms = 0
     # Create window and restore last position if available
     cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+    # Overlay toggle state and mouse callback (button rect updated each frame)
+    overlay_state = {"enabled": True, "rect": (0, 0, 0, 0)}
+    cv2.setMouseCallback(window_name, on_mouse, overlay_state)
     pos = load_window_pos()
     if pos:
         try:
@@ -499,28 +525,18 @@ def main() -> None:
             gesture_window.append(gesture)
 
             # Determine stable gesture by majority vote over the window
-            stable_gesture = None
-            if len(gesture_window) > 0:
-                counts = Counter(gesture_window)
-                most = counts.most_common(1)
-                if most:
-                    candidate, votes = most[0]
-                    if candidate is not None and votes >= SMOOTHING_THRESHOLD:
-                        stable_gesture = candidate
+            stable_gesture = get_stable_gesture(gesture_window)
 
-            # Draw debug overlay showing landmarks, per-finger ext, smoothing timeline
+            # Draw debug overlay showing landmarks, per-finger extension, thumb state
+            # and wrist radius. This is useful for understanding how the gesture classification works 
+            # and for tuning thresholds. It can be toggled on/off with the button in the bottom-right
             try:
-                draw_detection_overlay(
-                    frame,
-                    result.hand_landmarks[0] if result.hand_landmarks else None,
-                    handedness_label,
-                    gesture_window,
-                    stable_gesture,
-                    SMOOTHING_WINDOW,
-                    SMOOTHING_THRESHOLD,
-                    last_seen_open_time,
-                    SEQUENCE_WINDOW,
-                )
+                if overlay_state.get("enabled", True):
+                    draw_detection_overlay(
+                        frame,
+                        result.hand_landmarks[0] if result.hand_landmarks else None,
+                        handedness_label,
+                    )
             except Exception:
                 pass
 
@@ -528,33 +544,43 @@ def main() -> None:
             action_info = "waiting"
             # Use the smoothed/stable gesture for control decisions
             if stable_gesture is None:
-                last_triggered_gesture = None
-            elif stable_gesture == "open":
-                # record the time we saw an open hand; waiting for fist next
-                last_seen_open_time = now
-            elif stable_gesture in GESTURE_ACTIONS and stable_gesture != last_triggered_gesture and (now - last_action_time) >= args.cooldown:
-                # For fist, require open -> fist sequence within SEQUENCE_WINDOW
-                if stable_gesture == "fist":
-                    if last_seen_open_time == 0.0 or (now - last_seen_open_time) > SEQUENCE_WINDOW:
-                        action_info = "waiting for open->fist sequence"
+                # Start or continue the no-gesture timer; only clear the
+                # last_triggered_gesture after None persists longer than
+                # NO_GESTURE_CLEAR_TIME. This prevents transient detection
+                # dropouts from allowing an identical gesture to retrigger.
+                if no_gesture_start == 0.0:
+                    no_gesture_start = now
+                elif (now - no_gesture_start) > NO_GESTURE_CLEAR_TIME:
+                    last_triggered_gesture = None
+            else:
+                # Reset no-gesture timer when we have a valid stable gesture
+                no_gesture_start = 0.0
+                if stable_gesture == "open":
+                    # record the time we saw an open hand; waiting for fist next
+                    last_seen_open_time = now
+                elif stable_gesture in GESTURE_ACTIONS and stable_gesture != last_triggered_gesture and (now - last_action_time) >= args.cooldown:
+                    # For fist, require open -> fist sequence within SEQUENCE_WINDOW
+                    if stable_gesture == "fist":
+                        if last_seen_open_time == 0.0 or (now - last_seen_open_time) > SEQUENCE_WINDOW:
+                            action_info = "waiting for open->fist sequence"
+                        else:
+                            app_key, operation = GESTURE_ACTIONS[stable_gesture]
+                            action_info_res, last_label, ok = perform_app_action(app_key, operation, controllers)
+                            action_info = action_info_res
+                            if ok and last_label:
+                                last_action_label = last_label
+                                last_action_time = now
+                                last_triggered_gesture = stable_gesture
+                                last_seen_open_time = 0.0
                     else:
                         app_key, operation = GESTURE_ACTIONS[stable_gesture]
                         action_info_res, last_label, ok = perform_app_action(app_key, operation, controllers)
                         action_info = action_info_res
                         if ok and last_label:
                             last_action_label = last_label
+                        if ok:
                             last_action_time = now
                             last_triggered_gesture = stable_gesture
-                            last_seen_open_time = 0.0
-                else:
-                    app_key, operation = GESTURE_ACTIONS[stable_gesture]
-                    action_info_res, last_label, ok = perform_app_action(app_key, operation, controllers)
-                    action_info = action_info_res
-                    if ok and last_label:
-                        last_action_label = last_label
-                    if ok:
-                        last_action_time = now
-                        last_triggered_gesture = stable_gesture
 
             cv2.rectangle(frame, (0, 0), (frame.shape[1], 85), (245, 245, 245), -1)
             cv2.putText(
@@ -566,6 +592,17 @@ def main() -> None:
                 (30, 30, 30),
                 2,
             )
+            # Draw stable-gesture vote counter in header (right side)
+            try:
+                non_none = [g for g in gesture_window if g is not None]
+                counts = Counter(non_none)
+                votes = counts.get(stable_gesture, 0) if stable_gesture else 0
+                stab_text = f"Stable: {stable_gesture or 'none'} ({votes}/{SMOOTHING_WINDOW})"
+                text_size = cv2.getTextSize(stab_text, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 2)[0]
+                x = frame.shape[1] - text_size[0] - 12
+                cv2.putText(frame, stab_text, (x, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 140, 0) if stable_gesture else (120, 120, 120), 2)
+            except Exception:
+                pass
             cv2.putText(
                 frame,
                 f"Last action: {last_action_label} | {action_info}",
@@ -585,6 +622,8 @@ def main() -> None:
                 1,
             )
 
+            
+
             # Check whether the window still exists before showing a frame.
             try:
                 if cv2.getWindowProperty(window_name, cv2.WND_PROP_VISIBLE) < 1:
@@ -593,7 +632,9 @@ def main() -> None:
                 if get_window_pos_native(window_name) is None:
                     break
 
-            cv2.imshow(window_name, frame)
+            # Show the composed display (resized, centered)
+            display = compose_display(frame, window_name, overlay_state)
+            cv2.imshow(window_name, display)
             key = cv2.waitKey(1) & 0xFF
 
             # Re-check after waitKey in case the user closed the window while it was shown.
