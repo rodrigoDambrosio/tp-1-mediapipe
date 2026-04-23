@@ -13,6 +13,7 @@ from mediapipe.tasks import python as mp_python
 from mediapipe.tasks.python import vision
 import json
 import ctypes
+from typing import Any
 
 
 APP_PRESETS = {
@@ -105,7 +106,7 @@ def ensure_hand_model_downloaded() -> Path:
     return model_path
 
 
-def create_landmarker(model_path: Path, max_hands: int = 1) -> object:
+def create_landmarker(model_path: Path, max_hands: int = 1) -> Any:
     options = vision.HandLandmarkerOptions(
         base_options=mp_python.BaseOptions(model_asset_path=str(model_path)),
         running_mode=vision.RunningMode.VIDEO,
@@ -175,7 +176,6 @@ def classify_gesture(hand_landmarks, handedness_label: str | None = None) -> str
 
 def draw_detection_overlay(frame, hand_landmarks, handedness_label):
     h, w = frame.shape[:2]
-    now = time.monotonic()
 
     
     if hand_landmarks:
@@ -527,7 +527,9 @@ def main() -> None:
             # Determine stable gesture by majority vote over the window
             stable_gesture = get_stable_gesture(gesture_window)
 
-            # Draw debug overlay showing landmarks, per-finger ext, smoothing timeline
+            # Draw debug overlay showing landmarks, per-finger extension, thumb state
+            # and wrist radius. This is useful for understanding how the gesture classification works 
+            # and for tuning thresholds. It can be toggled on/off with the button in the bottom-right
             try:
                 if overlay_state.get("enabled", True):
                     draw_detection_overlay(
