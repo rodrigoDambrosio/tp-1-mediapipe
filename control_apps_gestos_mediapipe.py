@@ -295,6 +295,18 @@ def draw_detection_overlay(
     cv2.putText(frame, "y_delta=0.015 | avg_r=0.22", (10, frame.shape[0] - 45), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (100, 100, 100), 1)
 
 
+def on_mouse(event, x, y, flags, param):
+    """Mouse callback to toggle overlay when the button is clicked.
+
+    `param` is expected to be a dict with keys `enabled` and `rect`.
+    """
+    state = param
+    if event == cv2.EVENT_LBUTTONDOWN:
+        x1, y1, x2, y2 = state.get("rect", (0, 0, 0, 0))
+        if x1 <= x <= x2 and y1 <= y <= y2:
+            state["enabled"] = not state.get("enabled", True)
+
+
 @dataclass
 class AppController:
     open_cmd: list[str]
@@ -460,6 +472,9 @@ def main() -> None:
     last_timestamp_ms = 0
     # Create window and restore last position if available
     cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+    # Overlay toggle state and mouse callback (button rect updated each frame)
+    overlay_state = {"enabled": True, "rect": (0, 0, 0, 0)}
+    cv2.setMouseCallback(window_name, on_mouse, overlay_state)
     pos = load_window_pos()
     if pos:
         try:
@@ -513,17 +528,18 @@ def main() -> None:
 
             # Draw debug overlay showing landmarks, per-finger ext, smoothing timeline
             try:
-                draw_detection_overlay(
-                    frame,
-                    result.hand_landmarks[0] if result.hand_landmarks else None,
-                    handedness_label,
-                    gesture_window,
-                    stable_gesture,
-                    SMOOTHING_WINDOW,
-                    SMOOTHING_THRESHOLD,
-                    last_seen_open_time,
-                    SEQUENCE_WINDOW,
-                )
+                if overlay_state.get("enabled", True):
+                    draw_detection_overlay(
+                        frame,
+                        result.hand_landmarks[0] if result.hand_landmarks else None,
+                        handedness_label,
+                        gesture_window,
+                        stable_gesture,
+                        SMOOTHING_WINDOW,
+                        SMOOTHING_THRESHOLD,
+                        last_seen_open_time,
+                        SEQUENCE_WINDOW,
+                    )
             except Exception:
                 pass
 
@@ -597,6 +613,25 @@ def main() -> None:
                 (50, 50, 50),
                 1,
             )
+
+            # Draw overlay toggle button (top-right)
+            btn_w, btn_h = 140, 36
+            bx1 = frame.shape[1] - btn_w - 10
+            by1 = 10
+            bx2 = bx1 + btn_w
+            by2 = by1 + btn_h
+            overlay_state["rect"] = (bx1, by1, bx2, by2)
+            if overlay_state.get("enabled", True):
+                btn_color = (0, 200, 0)  # bright green when enabled (high contrast)
+                txt = "DEBUG: ON"
+            else:
+                btn_color = (80, 80, 80)
+                txt = "DEBUG: OFF"
+            cv2.rectangle(frame, (bx1, by1), (bx2, by2), btn_color, -1)
+            cv2.rectangle(frame, (bx1, by1), (bx2, by2), (0, 0, 0), 1)
+            # slightly smaller text to fit the larger button
+            text_y = by1 + int(btn_h * 0.65)
+            cv2.putText(frame, txt, (bx1 + 8, text_y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1)
 
             # Check whether the window still exists before showing a frame.
             try:
