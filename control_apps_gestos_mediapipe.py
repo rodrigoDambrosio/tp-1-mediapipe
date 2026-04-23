@@ -151,7 +151,7 @@ def classify_gesture(hand_landmarks, handedness_label: str | None = None) -> str
     avg_tip_wrist = sum(_distance(hand_landmarks[idx], wrist) for idx in tip_indices) / len(tip_indices)
 
     # Detect open hand when most fingers (including thumb) are extended
-    if extended >= 4 and avg_tip_wrist > AVG_TIP_WRIST_THRESHOLD:
+    if extended > 4 and avg_tip_wrist > AVG_TIP_WRIST_THRESHOLD:
         return "open"
 
     if extended == 0 and avg_tip_wrist < AVG_TIP_WRIST_THRESHOLD:
