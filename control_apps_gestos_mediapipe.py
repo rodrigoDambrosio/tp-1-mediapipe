@@ -4,6 +4,7 @@ import time
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
+from collections import deque, Counter
 
 import cv2
 import mediapipe as mp
@@ -43,6 +44,13 @@ HAND_MODEL_URL = (
     "hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task"
 )
 HAND_MODEL_FILENAME = "hand_landmarker.task"
+
+# Detection and smoothing thresholds (tweakable)
+Y_DELTA_THRESHOLD = 0.015
+AVG_TIP_WRIST_THRESHOLD = 0.22
+SMOOTHING_WINDOW = 5
+SMOOTHING_THRESHOLD = 3
+SEQUENCE_WINDOW = 2.0
 
 
 def parse_source(source_arg: str):
@@ -125,7 +133,7 @@ def classify_gesture(hand_landmarks, handedness_label: str | None = None) -> str
 
     extended = 0
     for tip_idx, pip_idx in finger_pairs:
-        if hand_landmarks[tip_idx].y < hand_landmarks[pip_idx].y - 0.015:
+        if hand_landmarks[tip_idx].y < hand_landmarks[pip_idx].y - Y_DELTA_THRESHOLD:
             extended += 1
 
     thumb_extended = False
@@ -142,7 +150,11 @@ def classify_gesture(hand_landmarks, handedness_label: str | None = None) -> str
     tip_indices = [4, 8, 12, 16, 20]
     avg_tip_wrist = sum(_distance(hand_landmarks[idx], wrist) for idx in tip_indices) / len(tip_indices)
 
-    if extended == 0 and avg_tip_wrist < 0.22:
+    # Detect open hand when most fingers (including thumb) are extended
+    if extended > 4 and avg_tip_wrist > AVG_TIP_WRIST_THRESHOLD:
+        return "open"
+
+    if extended == 0 and avg_tip_wrist < AVG_TIP_WRIST_THRESHOLD:
         return "fist"
 
     if extended == 1:
@@ -155,6 +167,131 @@ def classify_gesture(hand_landmarks, handedness_label: str | None = None) -> str
         return "three"
 
     return None
+
+
+def draw_detection_overlay(
+    frame,
+    hand_landmarks,
+    handedness_label,
+    gesture_window,
+    stable_gesture,
+    smoothing_window,
+    smoothing_threshold,
+    last_seen_open_time,
+    sequence_window,
+):
+    h, w = frame.shape[:2]
+    now = time.monotonic()
+
+    # color palette
+    COLORS = {
+        None: (200, 200, 200),
+        "open": (0, 200, 0),
+        "fist": (0, 0, 200),
+        "one": (255, 0, 0),
+        "two": (0, 180, 180),
+        "three": (0, 180, 255),
+    }
+
+    # Draw landmarks and bones if available
+    if hand_landmarks:
+        pts = [(int(lm.x * w), int(lm.y * h)) for lm in hand_landmarks]
+
+        # simple skeleton connections (approximate MediaPipe topology)
+        connections = [
+            (0, 1), (1, 2), (2, 3), (3, 4),
+            (0, 5), (5, 6), (6, 7), (7, 8),
+            (5, 9), (9, 10), (10, 11), (11, 12),
+            (9, 13), (13, 14), (14, 15), (15, 16),
+            (13, 17), (17, 18), (18, 19), (19, 20),
+            (0, 17),
+        ]
+
+        for a, b in connections:
+            if a < len(pts) and b < len(pts):
+                cv2.line(frame, pts[a], pts[b], (180, 180, 180), 1)
+
+        for i, p in enumerate(pts):
+            cv2.circle(frame, p, 3, (40, 40, 40), -1)
+
+        # Per-finger extension visual (tip vs pip)
+        finger_pairs = [(8, 6), (12, 10), (16, 14), (20, 18)]
+        for tip_idx, pip_idx in finger_pairs:
+            tip = hand_landmarks[tip_idx]
+            pip = hand_landmarks[pip_idx]
+            extended = tip.y < pip.y - Y_DELTA_THRESHOLD
+            tip_pt = (int(tip.x * w), int(tip.y * h))
+            pip_pt = (int(pip.x * w), int(pip.y * h))
+            col = (0, 200, 0) if extended else (0, 0, 200)
+            cv2.line(frame, pip_pt, tip_pt, col, 3)
+            cv2.putText(
+                frame,
+                "EXT" if extended else "FLX",
+                (pip_pt[0] - 10, pip_pt[1] - 10),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.4,
+                col,
+                1,
+            )
+
+        # Thumb indicator
+        thumb_tip = hand_landmarks[4]
+        thumb_ip = hand_landmarks[3]
+        if handedness_label == "Right":
+            thumb_ext = thumb_tip.x < thumb_ip.x - 0.015
+        elif handedness_label == "Left":
+            thumb_ext = thumb_tip.x > thumb_ip.x + 0.015
+        else:
+            thumb_ext = abs(thumb_tip.x - thumb_ip.x) > 0.05
+        tt = (int(thumb_tip.x * w), int(thumb_tip.y * h))
+        ti = (int(thumb_ip.x * w), int(thumb_ip.y * h))
+        col = (0, 200, 0) if thumb_ext else (0, 0, 200)
+        cv2.line(frame, ti, tt, col, 3)
+        cv2.putText(frame, "T-EXT" if thumb_ext else "T-FLX", (ti[0] - 10, ti[1] - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.4, col, 1)
+
+        # Wrist radius circle based on avg tip distance
+        wrist = hand_landmarks[0]
+        tip_indices = [4, 8, 12, 16, 20]
+        avg_tip_wrist = sum(_distance(hand_landmarks[idx], wrist) for idx in tip_indices) / len(tip_indices)
+        # scale normalized distance to pixels (rough)
+        scale = (w + h) / 2.0
+        radius_px = max(6, int(avg_tip_wrist * scale * 0.5))
+        wrist_pt = (int(wrist.x * w), int(wrist.y * h))
+        col = (0, 200, 0) if avg_tip_wrist > AVG_TIP_WRIST_THRESHOLD else (0, 0, 200)
+        cv2.circle(frame, wrist_pt, radius_px, col, 2)
+        cv2.putText(frame, f"r={avg_tip_wrist:.2f}", (wrist_pt[0] + 8, wrist_pt[1] + 8), cv2.FONT_HERSHEY_SIMPLEX, 0.4, col, 1)
+
+    # Draw smoothing timeline (top-right)
+    box_w = 18
+    box_h = 18
+    spacing = 6
+    start_x = frame.shape[1] - (box_w + spacing) * smoothing_window - 10
+    y = 10
+    counts = Counter(gesture_window)
+    for i in range(smoothing_window):
+        idx = max(0, len(gesture_window) - smoothing_window) + i
+        g = gesture_window[idx] if idx < len(gesture_window) else None
+        col = COLORS.get(g, (200, 200, 200))
+        x = start_x + i * (box_w + spacing)
+        cv2.rectangle(frame, (x, y), (x + box_w, y + box_h), col, -1)
+        if g:
+            cv2.putText(frame, (g[0] if g else "-"), (x + 4, y + 14), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 0), 1)
+
+    # Stable gesture and votes
+    votes = counts.get(stable_gesture, 0) if stable_gesture else 0
+    stable_col = COLORS.get(stable_gesture, (200, 200, 200))
+    cv2.putText(frame, f"Stable: {stable_gesture or 'none'} ({votes}/{smoothing_window})", (10, frame.shape[0] - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, stable_col, 2)
+
+    # Sequence indicator
+    seq_x = frame.shape[1] - 220
+    seq_y = frame.shape[0] - 40
+    cv2.putText(frame, "[OPEN] -> [FIST]", (seq_x, seq_y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (80, 80, 80), 2)
+    if last_seen_open_time and (now - last_seen_open_time) <= sequence_window:
+        left = sequence_window - (now - last_seen_open_time)
+        cv2.putText(frame, f"wait {left:.1f}s", (seq_x + 10, seq_y - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 160, 255), 2)
+
+    # Thresholds info
+    cv2.putText(frame, "y_delta=0.015 | avg_r=0.22", (10, frame.shape[0] - 45), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (100, 100, 100), 1)
 
 
 @dataclass
@@ -202,6 +339,31 @@ def build_app_controllers() -> dict[str, tuple[str, AppController]]:
             AppController(open_cmd=data["open_cmd"], process_name=data["process_name"]),
         )
     return controllers
+
+
+def perform_app_action(app_key: str, operation: str, controllers: dict[str, tuple[str, AppController]]):
+    """Perform the requested operation for an app and return (action_info, last_action_label, success).
+
+    - `operation` can be 'open', 'toggle', or other (treated as close).
+    - Returns a tuple: (human-readable action_info, last_action_label_or_None, success_bool)
+    """
+    app_label, controller = controllers[app_key]
+
+    if operation == "open":
+        ok = controller.open_app()
+        return (f"opened {app_label}" if ok else f"open {app_label} failed", f"open {app_label}" if ok else None, ok)
+
+    if operation == "toggle":
+        if controller.is_running():
+            ok = controller.close_app()
+            return (f"closed {app_label}" if ok else f"close {app_label} failed", f"close {app_label}" if ok else None, ok)
+        else:
+            ok = controller.open_app()
+            return (f"opened {app_label}" if ok else f"open {app_label} failed", f"open {app_label}" if ok else None, ok)
+
+    # fallback: try to close
+    ok = controller.close_app()
+    return (f"closed {app_label}" if ok else f"close {app_label} failed", f"close {app_label}" if ok else None, ok)
 
 
 # Window position persistence
@@ -287,6 +449,9 @@ def main() -> None:
     last_action_time = 0.0
     last_action_label = "none"
     last_triggered_gesture = None
+    last_seen_open_time = 0.0
+    # Gesture smoothing window
+    gesture_window = deque(maxlen=SMOOTHING_WINDOW)
     window_name = "MediaPipe Gesture App Control"
     # Keep a strictly increasing timestamp for MediaPipe's video API
     last_timestamp_ms = 0
@@ -303,7 +468,7 @@ def main() -> None:
     print("Gesture mapping:")
     print("  - 1 finger  -> toggle Paint (open/close)")
     print("  - 2 fingers -> toggle Calculator (open/close)")
-    print("  - Fist      -> toggle Notepad (open/close)")
+    print("  - Open then Fist -> toggle Notepad (open/close)")
     print("Keys: Q or ESC to exit")
 
     try:
@@ -324,48 +489,72 @@ def main() -> None:
             result = landmarker.detect_for_video(mp_image, timestamp_ms)
 
             gesture = None
+            handedness_label = None
             if result.hand_landmarks:
-                handedness_label = None
                 if result.handedness and result.handedness[0]:
                     handedness_label = result.handedness[0][0].category_name
                 gesture = classify_gesture(result.hand_landmarks[0], handedness_label)
 
+            # Append latest raw detection into the smoothing window
+            gesture_window.append(gesture)
+
+            # Determine stable gesture by majority vote over the window
+            stable_gesture = None
+            if len(gesture_window) > 0:
+                counts = Counter(gesture_window)
+                most = counts.most_common(1)
+                if most:
+                    candidate, votes = most[0]
+                    if candidate is not None and votes >= SMOOTHING_THRESHOLD:
+                        stable_gesture = candidate
+
+            # Draw debug overlay showing landmarks, per-finger ext, smoothing timeline
+            try:
+                draw_detection_overlay(
+                    frame,
+                    result.hand_landmarks[0] if result.hand_landmarks else None,
+                    handedness_label,
+                    gesture_window,
+                    stable_gesture,
+                    SMOOTHING_WINDOW,
+                    SMOOTHING_THRESHOLD,
+                    last_seen_open_time,
+                    SEQUENCE_WINDOW,
+                )
+            except Exception:
+                pass
+
             now = time.monotonic()
             action_info = "waiting"
-            if gesture is None:
+            # Use the smoothed/stable gesture for control decisions
+            if stable_gesture is None:
                 last_triggered_gesture = None
-            elif gesture in GESTURE_ACTIONS and gesture != last_triggered_gesture and (now - last_action_time) >= args.cooldown:
-                app_key, operation = GESTURE_ACTIONS[gesture]
-                app_label, controller = controllers[app_key]
-
-                if operation == "open":
-                    if controller.open_app():
-                        action_info = f"opened {app_label}"
-                        last_action_label = f"open {app_label}"
+            elif stable_gesture == "open":
+                # record the time we saw an open hand; waiting for fist next
+                last_seen_open_time = now
+            elif stable_gesture in GESTURE_ACTIONS and stable_gesture != last_triggered_gesture and (now - last_action_time) >= args.cooldown:
+                # For fist, require open -> fist sequence within SEQUENCE_WINDOW
+                if stable_gesture == "fist":
+                    if last_seen_open_time == 0.0 or (now - last_seen_open_time) > SEQUENCE_WINDOW:
+                        action_info = "waiting for open->fist sequence"
                     else:
-                        action_info = f"open {app_label} failed"
-                elif operation == "toggle":
-                    if controller.is_running():
-                        if controller.close_app():
-                            action_info = f"closed {app_label}"
-                            last_action_label = f"close {app_label}"
-                        else:
-                            action_info = f"close {app_label} failed"
-                    else:
-                        if controller.open_app():
-                            action_info = f"opened {app_label}"
-                            last_action_label = f"open {app_label}"
-                        else:
-                            action_info = f"open {app_label} failed"
+                        app_key, operation = GESTURE_ACTIONS[stable_gesture]
+                        action_info_res, last_label, ok = perform_app_action(app_key, operation, controllers)
+                        action_info = action_info_res
+                        if ok and last_label:
+                            last_action_label = last_label
+                            last_action_time = now
+                            last_triggered_gesture = stable_gesture
+                            last_seen_open_time = 0.0
                 else:
-                    if controller.close_app():
-                        action_info = f"closed {app_label}"
-                        last_action_label = f"close {app_label}"
-                    else:
-                        action_info = f"close {app_label} failed"
-
-                last_action_time = now
-                last_triggered_gesture = gesture
+                    app_key, operation = GESTURE_ACTIONS[stable_gesture]
+                    action_info_res, last_label, ok = perform_app_action(app_key, operation, controllers)
+                    action_info = action_info_res
+                    if ok and last_label:
+                        last_action_label = last_label
+                    if ok:
+                        last_action_time = now
+                        last_triggered_gesture = stable_gesture
 
             cv2.rectangle(frame, (0, 0), (frame.shape[1], 85), (245, 245, 245), -1)
             cv2.putText(
@@ -388,7 +577,7 @@ def main() -> None:
             )
             cv2.putText(
                 frame,
-                "1:P toggle | 2:C toggle | Fist:N toggle",
+                "1:P toggle | 2:C toggle | Open+Fist:N toggle",
                 (10, 78),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.5,
