@@ -51,8 +51,7 @@ AVG_TIP_WRIST_THRESHOLD = 0.22
 SMOOTHING_WINDOW = 5
 SMOOTHING_THRESHOLD = 3
 SEQUENCE_WINDOW = 2.0
-NO_GESTURE_CLEAR_TIME = 1.0  # seconds of sustained None before clearing last_triggered_gesture
-# Thumb detection thresholds
+NO_GESTURE_CLEAR_TIME = 1.0
 THUMB_X_DELTA_THRESHOLD = 0.015
 THUMB_X_FALLBACK = 0.05
 
@@ -106,7 +105,7 @@ def ensure_hand_model_downloaded() -> Path:
     return model_path
 
 
-def create_landmarker(model_path: Path, max_hands: int = 1) -> vision.HandLandmarker:
+def create_landmarker(model_path: Path, max_hands: int = 1) -> object:
     options = vision.HandLandmarkerOptions(
         base_options=mp_python.BaseOptions(model_asset_path=str(model_path)),
         running_mode=vision.RunningMode.VIDEO,
@@ -129,10 +128,10 @@ def classify_gesture(hand_landmarks, handedness_label: str | None = None) -> str
     wrist = hand_landmarks[0]
 
     finger_pairs = [
-        (8, 6),   # index
-        (12, 10), # middle
-        (16, 14), # ring
-        (20, 18), # pinky
+        (8, 6),
+        (12, 10),
+        (16, 14),
+        (20, 18),
     ]
 
     extended = 0
@@ -174,34 +173,15 @@ def classify_gesture(hand_landmarks, handedness_label: str | None = None) -> str
     return None
 
 
-def draw_detection_overlay(
-    frame,
-    hand_landmarks,
-    handedness_label,
-    gesture_window,
-    stable_gesture,
-    smoothing_window,
-    last_seen_open_time,
-    sequence_window,
-):
+def draw_detection_overlay(frame, hand_landmarks, handedness_label):
     h, w = frame.shape[:2]
     now = time.monotonic()
 
-    # color palette
-    COLORS = {
-        None: (200, 200, 200),
-        "open": (0, 200, 0),
-        "fist": (0, 0, 200),
-        "one": (255, 0, 0),
-        "two": (0, 180, 180),
-        "three": (0, 180, 255),
-    }
-
-    # Draw landmarks and bones if available
+    
     if hand_landmarks:
         pts = [(int(lm.x * w), int(lm.y * h)) for lm in hand_landmarks]
 
-        # simple skeleton connections (approximate MediaPipe topology)
+        
         connections = [
             (0, 1), (1, 2), (2, 3), (3, 4),
             (0, 5), (5, 6), (6, 7), (7, 8),
@@ -218,7 +198,7 @@ def draw_detection_overlay(
         for i, p in enumerate(pts):
             cv2.circle(frame, p, 3, (40, 40, 40), -1)
 
-        # Per-finger extension visual (tip vs pip)
+        
         finger_pairs = [(8, 6), (12, 10), (16, 14), (20, 18)]
         for tip_idx, pip_idx in finger_pairs:
             tip = hand_landmarks[tip_idx]
@@ -238,7 +218,7 @@ def draw_detection_overlay(
                 1,
             )
 
-        # Thumb indicator
+        
         thumb_tip = hand_landmarks[4]
         thumb_ip = hand_landmarks[3]
         if handedness_label == "Right":
@@ -253,11 +233,11 @@ def draw_detection_overlay(
         cv2.line(frame, ti, tt, col, 3)
         cv2.putText(frame, "T-EXT" if thumb_ext else "T-FLX", (ti[0] - 10, ti[1] - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.4, col, 1)
 
-        # Wrist radius circle based on avg tip distance
+        
         wrist = hand_landmarks[0]
         tip_indices = [4, 8, 12, 16, 20]
         avg_tip_wrist = sum(_distance(hand_landmarks[idx], wrist) for idx in tip_indices) / len(tip_indices)
-        # scale normalized distance to pixels (rough)
+        
         scale = (w + h) / 2.0
         radius_px = max(6, int(avg_tip_wrist * scale * 0.5))
         wrist_pt = (int(wrist.x * w), int(wrist.y * h))
@@ -265,10 +245,7 @@ def draw_detection_overlay(
         cv2.circle(frame, wrist_pt, radius_px, col, 2)
         cv2.putText(frame, f"r={avg_tip_wrist:.2f}", (wrist_pt[0] + 8, wrist_pt[1] + 8), cv2.FONT_HERSHEY_SIMPLEX, 0.4, col, 1)
 
-    # Smoothing timeline, stable-gesture text and open->fist sequence indicator
-    # removed per user request.
-
-    # (Thresholds info removed from overlay)
+    
 
 
 def on_mouse(event, x, y, flags, param):
@@ -350,7 +327,7 @@ def perform_app_action(app_key: str, operation: str, controllers: dict[str, tupl
             ok = controller.open_app()
             return (f"opened {app_label}" if ok else f"open {app_label} failed", f"open {app_label}" if ok else None, ok)
 
-    # fallback: try to close
+    
     ok = controller.close_app()
     return (f"closed {app_label}" if ok else f"close {app_label} failed", f"close {app_label}" if ok else None, ok)
 
@@ -390,7 +367,7 @@ def compose_display(frame, window_name: str, overlay_state: dict) -> np.ndarray:
     yoff = (win_h - new_h) // 2
     display[yoff : yoff + new_h, xoff : xoff + new_w] = resized
 
-    # Draw overlay toggle button (lower-right) on display
+    
     btn_w, btn_h = 140, 36
     bx2 = win_w - 10
     by2 = win_h - 10
@@ -410,7 +387,7 @@ def compose_display(frame, window_name: str, overlay_state: dict) -> np.ndarray:
     return display
 
 
-# Window position persistence
+
 WINDOW_STATE_FILE = Path(__file__).with_name("window_state.json")
 
 
@@ -451,7 +428,7 @@ def get_window_pos_native(window_name: str) -> tuple[int, int] | None:
 
 
 def get_window_pos(window_name: str) -> tuple[int, int] | None:
-    # Prefer OpenCV's API if available
+    
     try:
         rect = cv2.getWindowImageRect(window_name)
         if rect and len(rect) >= 2:
@@ -557,11 +534,6 @@ def main() -> None:
                         frame,
                         result.hand_landmarks[0] if result.hand_landmarks else None,
                         handedness_label,
-                        gesture_window,
-                        stable_gesture,
-                        SMOOTHING_WINDOW,
-                        last_seen_open_time,
-                        SEQUENCE_WINDOW,
                     )
             except Exception:
                 pass
@@ -664,7 +636,6 @@ def main() -> None:
             resized = cv2.resize(frame, (new_w, new_h), interpolation=interp)
 
             # Create display background and place resized frame centered
-            import numpy as np
             display = np.full((win_h, win_w, 3), 245, dtype=np.uint8)
             xoff = (win_w - new_w) // 2
             yoff = (win_h - new_h) // 2
