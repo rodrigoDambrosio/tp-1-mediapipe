@@ -45,6 +45,13 @@ HAND_MODEL_URL = (
 )
 HAND_MODEL_FILENAME = "hand_landmarker.task"
 
+# Detection and smoothing thresholds (tweakable)
+Y_DELTA_THRESHOLD = 0.015
+AVG_TIP_WRIST_THRESHOLD = 0.22
+SMOOTHING_WINDOW = 5
+SMOOTHING_THRESHOLD = 3
+SEQUENCE_WINDOW = 2.0
+
 
 def parse_source(source_arg: str):
     source_arg = source_arg.strip()
@@ -126,7 +133,7 @@ def classify_gesture(hand_landmarks, handedness_label: str | None = None) -> str
 
     extended = 0
     for tip_idx, pip_idx in finger_pairs:
-        if hand_landmarks[tip_idx].y < hand_landmarks[pip_idx].y - 0.015:
+        if hand_landmarks[tip_idx].y < hand_landmarks[pip_idx].y - Y_DELTA_THRESHOLD:
             extended += 1
 
     thumb_extended = False
@@ -144,10 +151,10 @@ def classify_gesture(hand_landmarks, handedness_label: str | None = None) -> str
     avg_tip_wrist = sum(_distance(hand_landmarks[idx], wrist) for idx in tip_indices) / len(tip_indices)
 
     # Detect open hand when most fingers (including thumb) are extended
-    if extended >= 4 and avg_tip_wrist > 0.22:
+    if extended >= 4 and avg_tip_wrist > AVG_TIP_WRIST_THRESHOLD:
         return "open"
 
-    if extended == 0 and avg_tip_wrist < 0.22:
+    if extended == 0 and avg_tip_wrist < AVG_TIP_WRIST_THRESHOLD:
         return "fist"
 
     if extended == 1:
@@ -212,7 +219,7 @@ def draw_detection_overlay(
         for tip_idx, pip_idx in finger_pairs:
             tip = hand_landmarks[tip_idx]
             pip = hand_landmarks[pip_idx]
-            extended = tip.y < pip.y - 0.015
+            extended = tip.y < pip.y - Y_DELTA_THRESHOLD
             tip_pt = (int(tip.x * w), int(tip.y * h))
             pip_pt = (int(pip.x * w), int(pip.y * h))
             col = (0, 200, 0) if extended else (0, 0, 200)
@@ -250,7 +257,7 @@ def draw_detection_overlay(
         scale = (w + h) / 2.0
         radius_px = max(6, int(avg_tip_wrist * scale * 0.5))
         wrist_pt = (int(wrist.x * w), int(wrist.y * h))
-        col = (0, 200, 0) if avg_tip_wrist > 0.22 else (0, 0, 200)
+        col = (0, 200, 0) if avg_tip_wrist > AVG_TIP_WRIST_THRESHOLD else (0, 0, 200)
         cv2.circle(frame, wrist_pt, radius_px, col, 2)
         cv2.putText(frame, f"r={avg_tip_wrist:.2f}", (wrist_pt[0] + 8, wrist_pt[1] + 8), cv2.FONT_HERSHEY_SIMPLEX, 0.4, col, 1)
 
@@ -332,6 +339,31 @@ def build_app_controllers() -> dict[str, tuple[str, AppController]]:
             AppController(open_cmd=data["open_cmd"], process_name=data["process_name"]),
         )
     return controllers
+
+
+def perform_app_action(app_key: str, operation: str, controllers: dict[str, tuple[str, AppController]]):
+    """Perform the requested operation for an app and return (action_info, last_action_label, success).
+
+    - `operation` can be 'open', 'toggle', or other (treated as close).
+    - Returns a tuple: (human-readable action_info, last_action_label_or_None, success_bool)
+    """
+    app_label, controller = controllers[app_key]
+
+    if operation == "open":
+        ok = controller.open_app()
+        return (f"opened {app_label}" if ok else f"open {app_label} failed", f"open {app_label}" if ok else None, ok)
+
+    if operation == "toggle":
+        if controller.is_running():
+            ok = controller.close_app()
+            return (f"closed {app_label}" if ok else f"close {app_label} failed", f"close {app_label}" if ok else None, ok)
+        else:
+            ok = controller.open_app()
+            return (f"opened {app_label}" if ok else f"open {app_label} failed", f"open {app_label}" if ok else None, ok)
+
+    # fallback: try to close
+    ok = controller.close_app()
+    return (f"closed {app_label}" if ok else f"close {app_label} failed", f"close {app_label}" if ok else None, ok)
 
 
 # Window position persistence
@@ -418,10 +450,7 @@ def main() -> None:
     last_action_label = "none"
     last_triggered_gesture = None
     last_seen_open_time = 0.0
-    SEQUENCE_WINDOW = 2.0  # seconds allowed between open -> fist
-    # Gesture smoothing parameters
-    SMOOTHING_WINDOW = 5  # number of recent detections to consider
-    SMOOTHING_THRESHOLD = 3  # minimum votes required to accept a gesture
+    # Gesture smoothing window
     gesture_window = deque(maxlen=SMOOTHING_WINDOW)
     window_name = "MediaPipe Gesture App Control"
     # Keep a strictly increasing timestamp for MediaPipe's video API
@@ -508,72 +537,24 @@ def main() -> None:
                 if stable_gesture == "fist":
                     if last_seen_open_time == 0.0 or (now - last_seen_open_time) > SEQUENCE_WINDOW:
                         action_info = "waiting for open->fist sequence"
-                        # Do not trigger action yet
-                        pass
                     else:
                         app_key, operation = GESTURE_ACTIONS[stable_gesture]
-                        app_label, controller = controllers[app_key]
-                        if operation == "open":
-                            if controller.open_app():
-                                action_info = f"opened {app_label}"
-                                last_action_label = f"open {app_label}"
-                            else:
-                                action_info = f"open {app_label} failed"
-                        elif operation == "toggle":
-                            if controller.is_running():
-                                if controller.close_app():
-                                    action_info = f"closed {app_label}"
-                                    last_action_label = f"close {app_label}"
-                                else:
-                                    action_info = f"close {app_label} failed"
-                            else:
-                                if controller.open_app():
-                                    action_info = f"opened {app_label}"
-                                    last_action_label = f"open {app_label}"
-                                else:
-                                    action_info = f"open {app_label} failed"
-                        else:
-                            if controller.close_app():
-                                action_info = f"closed {app_label}"
-                                last_action_label = f"close {app_label}"
-                            else:
-                                action_info = f"close {app_label} failed"
-
-                        last_action_time = now
-                        last_triggered_gesture = stable_gesture
-                        last_seen_open_time = 0.0
+                        action_info_res, last_label, ok = perform_app_action(app_key, operation, controllers)
+                        action_info = action_info_res
+                        if ok and last_label:
+                            last_action_label = last_label
+                            last_action_time = now
+                            last_triggered_gesture = stable_gesture
+                            last_seen_open_time = 0.0
                 else:
                     app_key, operation = GESTURE_ACTIONS[stable_gesture]
-                    app_label, controller = controllers[app_key]
-
-                    if operation == "open":
-                        if controller.open_app():
-                            action_info = f"opened {app_label}"
-                            last_action_label = f"open {app_label}"
-                        else:
-                            action_info = f"open {app_label} failed"
-                    elif operation == "toggle":
-                        if controller.is_running():
-                            if controller.close_app():
-                                action_info = f"closed {app_label}"
-                                last_action_label = f"close {app_label}"
-                            else:
-                                action_info = f"close {app_label} failed"
-                        else:
-                            if controller.open_app():
-                                action_info = f"opened {app_label}"
-                                last_action_label = f"open {app_label}"
-                            else:
-                                action_info = f"open {app_label} failed"
-                    else:
-                        if controller.close_app():
-                            action_info = f"closed {app_label}"
-                            last_action_label = f"close {app_label}"
-                        else:
-                            action_info = f"close {app_label} failed"
-
-                    last_action_time = now
-                    last_triggered_gesture = stable_gesture
+                    action_info_res, last_label, ok = perform_app_action(app_key, operation, controllers)
+                    action_info = action_info_res
+                    if ok and last_label:
+                        last_action_label = last_label
+                    if ok:
+                        last_action_time = now
+                        last_triggered_gesture = stable_gesture
 
             cv2.rectangle(frame, (0, 0), (frame.shape[1], 85), (245, 245, 245), -1)
             cv2.putText(
