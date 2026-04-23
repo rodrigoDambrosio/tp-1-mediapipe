@@ -7,12 +7,12 @@ from pathlib import Path
 from collections import deque, Counter
 
 import cv2
+import numpy as np
 import mediapipe as mp
 from mediapipe.tasks import python as mp_python
 from mediapipe.tasks.python import vision
 import json
 import ctypes
-from ctypes import wintypes
 
 
 APP_PRESETS = {
@@ -265,45 +265,10 @@ def draw_detection_overlay(
         cv2.circle(frame, wrist_pt, radius_px, col, 2)
         cv2.putText(frame, f"r={avg_tip_wrist:.2f}", (wrist_pt[0] + 8, wrist_pt[1] + 8), cv2.FONT_HERSHEY_SIMPLEX, 0.4, col, 1)
 
-    # Draw smoothing timeline (top-right)
-    box_w = 18
-    box_h = 18
-    spacing = 6
-    start_x = frame.shape[1] - (box_w + spacing) * smoothing_window - 10
-    y = 10
-    counts = Counter(gesture_window)
-    for i in range(smoothing_window):
-        idx = max(0, len(gesture_window) - smoothing_window) + i
-        g = gesture_window[idx] if idx < len(gesture_window) else None
-        col = COLORS.get(g, (200, 200, 200))
-        x = start_x + i * (box_w + spacing)
-        cv2.rectangle(frame, (x, y), (x + box_w, y + box_h), col, -1)
-        if g:
-            cv2.putText(frame, (g[0] if g else "-"), (x + 4, y + 14), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 0), 1)
+    # Smoothing timeline, stable-gesture text and open->fist sequence indicator
+    # removed per user request.
 
-    # Stable gesture and votes
-    votes = counts.get(stable_gesture, 0) if stable_gesture else 0
-    stable_col = COLORS.get(stable_gesture, (200, 200, 200))
-    cv2.putText(frame, f"Stable: {stable_gesture or 'none'} ({votes}/{smoothing_window})", (10, frame.shape[0] - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, stable_col, 2)
-
-    # Sequence indicator
-    seq_x = frame.shape[1] - 220
-    seq_y = frame.shape[0] - 40
-    cv2.putText(frame, "[OPEN] -> [FIST]", (seq_x, seq_y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (80, 80, 80), 2)
-    if last_seen_open_time and (now - last_seen_open_time) <= sequence_window:
-        left = sequence_window - (now - last_seen_open_time)
-        cv2.putText(frame, f"wait {left:.1f}s", (seq_x + 10, seq_y - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 160, 255), 2)
-
-    # Thresholds info (reflect active constants)
-    cv2.putText(
-        frame,
-        f"y_delta={Y_DELTA_THRESHOLD:.3f} | avg_r={AVG_TIP_WRIST_THRESHOLD:.2f} | thumb_x={THUMB_X_DELTA_THRESHOLD:.3f}",
-        (10, frame.shape[0] - 45),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.5,
-        (100, 100, 100),
-        1,
-    )
+    # (Thresholds info removed from overlay)
 
 
 def on_mouse(event, x, y, flags, param):
@@ -388,6 +353,61 @@ def perform_app_action(app_key: str, operation: str, controllers: dict[str, tupl
     # fallback: try to close
     ok = controller.close_app()
     return (f"closed {app_label}" if ok else f"close {app_label} failed", f"close {app_label}" if ok else None, ok)
+
+
+def get_stable_gesture(gesture_window: deque) -> str | None:
+    """Return the stable gesture from the recent window or None.
+
+    Ignores None entries (no detection) so short dropouts don't mask
+    an otherwise-consistent gesture.
+    """
+    non_none = [g for g in gesture_window if g is not None]
+    if not non_none:
+        return None
+    counts = Counter(non_none)
+    candidate, votes = counts.most_common(1)[0]
+    return candidate if votes >= SMOOTHING_THRESHOLD else None
+
+
+def compose_display(frame, window_name: str, overlay_state: dict) -> np.ndarray:
+    """Scale `frame` to the current window while preserving aspect ratio,
+    center it on a neutral background and draw the overlay toggle button.
+    Returns the composed image to pass to `cv2.imshow`.
+    """
+    try:
+        _, _, win_w, win_h = cv2.getWindowImageRect(window_name)
+    except Exception:
+        win_w, win_h = frame.shape[1], frame.shape[0]
+
+    scale = min(win_w / frame.shape[1], win_h / frame.shape[0])
+    new_w = max(1, int(frame.shape[1] * scale))
+    new_h = max(1, int(frame.shape[0] * scale))
+    interp = cv2.INTER_AREA if scale < 1.0 else cv2.INTER_LINEAR
+    resized = cv2.resize(frame, (new_w, new_h), interpolation=interp)
+
+    display = np.full((win_h, win_w, 3), 245, dtype=np.uint8)
+    xoff = (win_w - new_w) // 2
+    yoff = (win_h - new_h) // 2
+    display[yoff : yoff + new_h, xoff : xoff + new_w] = resized
+
+    # Draw overlay toggle button (lower-right) on display
+    btn_w, btn_h = 140, 36
+    bx2 = win_w - 10
+    by2 = win_h - 10
+    bx1 = bx2 - btn_w
+    by1 = by2 - btn_h
+    overlay_state["rect"] = (bx1, by1, bx2, by2)
+    if overlay_state.get("enabled", True):
+        btn_color = (0, 200, 0)
+        txt = "DEBUG: ON"
+    else:
+        btn_color = (80, 80, 80)
+        txt = "DEBUG: OFF"
+    cv2.rectangle(display, (bx1, by1), (bx2, by2), btn_color, -1)
+    cv2.rectangle(display, (bx1, by1), (bx2, by2), (0, 0, 0), 1)
+    text_y = by1 + int(btn_h * 0.65)
+    cv2.putText(display, txt, (bx1 + 8, text_y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1)
+    return display
 
 
 # Window position persistence
@@ -528,31 +548,21 @@ def main() -> None:
             gesture_window.append(gesture)
 
             # Determine stable gesture by majority vote over the window
-            stable_gesture = None
-            # Ignore None entries when selecting the stable gesture so that
-            # transient 'no detection' frames don't mask a valid gesture.
-            non_none = [g for g in gesture_window if g is not None]
-            if len(non_none) > 0:
-                counts = Counter(non_none)
-                most = counts.most_common(1)
-                if most:
-                    candidate, votes = most[0]
-                    if votes >= SMOOTHING_THRESHOLD:
-                        stable_gesture = candidate
+            stable_gesture = get_stable_gesture(gesture_window)
 
             # Draw debug overlay showing landmarks, per-finger ext, smoothing timeline
             try:
                 if overlay_state.get("enabled", True):
-                            draw_detection_overlay(
-                                frame,
-                                result.hand_landmarks[0] if result.hand_landmarks else None,
-                                handedness_label,
-                                gesture_window,
-                                stable_gesture,
-                                SMOOTHING_WINDOW,
-                                last_seen_open_time,
-                                SEQUENCE_WINDOW,
-                            )
+                    draw_detection_overlay(
+                        frame,
+                        result.hand_landmarks[0] if result.hand_landmarks else None,
+                        handedness_label,
+                        gesture_window,
+                        stable_gesture,
+                        SMOOTHING_WINDOW,
+                        last_seen_open_time,
+                        SEQUENCE_WINDOW,
+                    )
             except Exception:
                 pass
 
@@ -608,6 +618,17 @@ def main() -> None:
                 (30, 30, 30),
                 2,
             )
+            # Draw stable-gesture vote counter in header (right side)
+            try:
+                non_none = [g for g in gesture_window if g is not None]
+                counts = Counter(non_none)
+                votes = counts.get(stable_gesture, 0) if stable_gesture else 0
+                stab_text = f"Stable: {stable_gesture or 'none'} ({votes}/{SMOOTHING_WINDOW})"
+                text_size = cv2.getTextSize(stab_text, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 2)[0]
+                x = frame.shape[1] - text_size[0] - 12
+                cv2.putText(frame, stab_text, (x, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 140, 0) if stable_gesture else (120, 120, 120), 2)
+            except Exception:
+                pass
             cv2.putText(
                 frame,
                 f"Last action: {last_action_label} | {action_info}",
@@ -676,6 +697,7 @@ def main() -> None:
                     break
 
             # Show the composed display (resized, centered)
+            display = compose_display(frame, window_name, overlay_state)
             cv2.imshow(window_name, display)
             key = cv2.waitKey(1) & 0xFF
 
