@@ -620,44 +620,7 @@ def main() -> None:
                 1,
             )
 
-            # Compose a display image that fits the current window while
-            # preserving aspect ratio. Draw the overlay toggle button on the
-            # final display so mouse coordinates match window coordinates.
-            try:
-                win_x, win_y, win_w, win_h = cv2.getWindowImageRect(window_name)
-            except Exception:
-                win_w, win_h = frame.shape[1], frame.shape[0]
-
-            # Compute scale and centered offsets
-            scale = min(win_w / frame.shape[1], win_h / frame.shape[0])
-            new_w = max(1, int(frame.shape[1] * scale))
-            new_h = max(1, int(frame.shape[0] * scale))
-            interp = cv2.INTER_AREA if scale < 1.0 else cv2.INTER_LINEAR
-            resized = cv2.resize(frame, (new_w, new_h), interpolation=interp)
-
-            # Create display background and place resized frame centered
-            display = np.full((win_h, win_w, 3), 245, dtype=np.uint8)
-            xoff = (win_w - new_w) // 2
-            yoff = (win_h - new_h) // 2
-            display[yoff : yoff + new_h, xoff : xoff + new_w] = resized
-
-            # Draw overlay toggle button (top-right) on display
-            btn_w, btn_h = 140, 36
-            bx1 = win_w - btn_w - 10
-            by1 = 10
-            bx2 = bx1 + btn_w
-            by2 = by1 + btn_h
-            overlay_state["rect"] = (bx1, by1, bx2, by2)
-            if overlay_state.get("enabled", True):
-                btn_color = (0, 200, 0)  # bright green when enabled (high contrast)
-                txt = "DEBUG: ON"
-            else:
-                btn_color = (80, 80, 80)
-                txt = "DEBUG: OFF"
-            cv2.rectangle(display, (bx1, by1), (bx2, by2), btn_color, -1)
-            cv2.rectangle(display, (bx1, by1), (bx2, by2), (0, 0, 0), 1)
-            text_y = by1 + int(btn_h * 0.65)
-            cv2.putText(display, txt, (bx1 + 8, text_y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1)
+            
 
             # Check whether the window still exists before showing a frame.
             try:
